@@ -1,0 +1,775 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Storage Module Unit Tests</title>
+  <style>
+    body { font-family: monospace; padding: 1.5rem; background: #1a1a1a; color: #f0f0f0; }
+    h1   { color: #7BC8A4; margin-bottom: 1rem; }
+    .suite { margin-bottom: 1.5rem; }
+    .suite-title { font-size: 1.1rem; font-weight: bold; color: #36A2EB; margin-bottom: 0.5rem; }
+    .pass { color: #7BC8A4; }
+    .fail { color: #FF6384; }
+    .summary { margin-top: 1.5rem; font-size: 1.1rem; border-top: 1px solid #444; padding-top: 1rem; }
+    pre  { background: #2a2a2a; padding: 0.5rem; border-radius: 4px; white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <h1>Storage Module — Unit Tests</h1>
+  <div id="output"></div>
+
+  <script>
+    /* ============================================================
+       Minimal test runner
+       ============================================================ */
+    const results = [];
+
+    function describe(suiteName, fn) {
+      const suite = { name: suiteName, tests: [] };
+      results.push(suite);
+      const currentSuite = suite;
+
+      function it(testName, testFn) {
+        try {
+          testFn();
+          currentSuite.tests.push({ name: testName, passed: true });
+        } catch (e) {
+          currentSuite.tests.push({ name: testName, passed: false, error: e.message || String(e) });
+        }
+      }
+
+      fn(it);
+    }
+
+    function assert(condition, message) {
+      if (!condition) throw new Error(message || 'Assertion failed');
+    }
+
+    function assertEqual(actual, expected, message) {
+      const a = JSON.stringify(actual);
+      const e = JSON.stringify(expected);
+      if (a !== e) {
+        throw new Error((message || 'assertEqual failed') + '\n  actual:   ' + a + '\n  expected: ' + e);
+      }
+    }
+
+    function deepEqual(a, b) {
+      return JSON.stringify(a) === JSON.stringify(b);
+    }
+
+    /* ============================================================
+       Inline copies of the functions under test
+       (mirrors the implementations in app.js so tests run standalone)
+       ============================================================ */
+    const LS_KEY = 'expense_visualizer_transactions';
+
+    function loadTransactions(lsOverride) {
+      const ls = lsOverride || localStorage;
+      try {
+        const raw = ls.getItem(LS_KEY);
+        if (raw === null) {
+          return { transactions: [], storageError: false };
+        }
+        const parsed = JSON.parse(raw);
+        if (!Array.isArray(parsed)) {
+          return { transactions: [], storageError: true };
+        }
+        return { transactions: parsed, storageError: false };
+      } catch (e) {
+        return { transactions: [], storageError: true };
+      }
+    }
+
+    function saveTransactions(transactions, lsOverride) {
+      const ls = lsOverride || localStorage;
+      try {
+        ls.setItem(LS_KEY, JSON.stringify(transactions));
+        return { success: true };
+      } catch (e) {
+        return { success: false, error: e && e.message ? e.message : String(e) };
+      }
+    }
+
+    /* ============================================================
+       Mock localStorage helpers
+       ============================================================ */
+
+    /** A fully functional in-memory localStorage mock */
+    function makeMockStorage(initialData) {
+      const store = Object.assign({}, initialData || {});
+      return {
+        getItem(key)        { return Object.prototype.hasOwnProperty.call(store, key) ? store[key] : null; },
+        setItem(key, value) { store[key] = String(value); },
+        removeItem(key)     { delete store[key]; },
+        clear()             { Object.keys(store).forEach(k => delete store[k]); },
+        _store: store
+      };
+    }
+
+    /** A mock that throws on every call (simulates unavailable localStorage) */
+    function makeThrowingStorage(errorMessage) {
+      const msg = errorMessage || 'localStorage is not available';
+      return {
+        getItem()  { throw new DOMException(msg, 'SecurityError'); },
+        setItem()  { throw new DOMException(msg, 'SecurityError'); },
+        removeItem(){ throw new DOMException(msg, 'SecurityError'); },
+        clear()    { throw new DOMException(msg, 'SecurityError'); }
+      };
+    }
+
+    /** A mock whose setItem always throws (simulates quota exceeded) */
+    function makeQuotaExceededStorage() {
+      const store = {};
+      return {
+        getItem(key)        { return Object.prototype.hasOwnProperty.call(store, key) ? store[key] : null; },
+        setItem()           { throw new DOMException('QuotaExceededError', 'QuotaExceededError'); },
+        removeItem(key)     { delete store[key]; },
+        clear()             { Object.keys(store).forEach(k => delete store[k]); }
+      };
+    }
+
+    /* ============================================================
+       Sample data
+       ============================================================ */
+    const sampleTransactions = [
+      {
+        id: 'abc-1',
+        description: 'Lunch',
+        amount: 12.50,
+        category: 'Food',
+        type: 'expense',
+        date: '2025-01-15',
+        createdAt: 1736956800000
+      },
+      {
+        id: 'abc-2',
+        description: 'Salary',
+        amount: 3000.00,
+        category: 'Other',
+        type: 'income',
+        date: '2025-01-01',
+        createdAt: 1735689600000
+      }
+    ];
+
+    /* ============================================================
+       Test suites
+       ============================================================ */
+
+    describe('loadTransactions — normal cases', function (it) {
+
+      it('returns empty array and no error when key is absent', function () {
+        const ls = makeMockStorage(); // empty store
+        const result = loadTransactions(ls);
+        assertEqual(result.transactions, [], 'transactions should be []');
+        assertEqual(result.storageError, false, 'storageError should be false');
+      });
+
+      it('returns parsed transactions and no error when key is present', function () {
+        const ls = makeMockStorage({ [LS_KEY]: JSON.stringify(sampleTransactions) });
+        const result = loadTransactions(ls);
+        assert(deepEqual(result.transactions, sampleTransactions), 'transactions should match stored data');
+        assertEqual(result.storageError, false, 'storageError should be false');
+      });
+
+      it('returns empty array and no error for an empty stored array', function () {
+        const ls = makeMockStorage({ [LS_KEY]: '[]' });
+        const result = loadTransactions(ls);
+        assertEqual(result.transactions, [], 'transactions should be []');
+        assertEqual(result.storageError, false, 'storageError should be false');
+      });
+
+    });
+
+    describe('loadTransactions — error cases', function (it) {
+
+      it('returns [] and storageError=true when localStorage throws (unavailable)', function () {
+        const ls = makeThrowingStorage();
+        const result = loadTransactions(ls);
+        assertEqual(result.transactions, [], 'transactions should be []');
+        assertEqual(result.storageError, true, 'storageError should be true');
+      });
+
+      it('returns [] and storageError=true when stored value is invalid JSON', function () {
+        const ls = makeMockStorage({ [LS_KEY]: 'not-valid-json{{' });
+        const result = loadTransactions(ls);
+        assertEqual(result.transactions, [], 'transactions should be []');
+        assertEqual(result.storageError, true, 'storageError should be true');
+      });
+
+      it('returns [] and storageError=true when stored value is a JSON object (not array)', function () {
+        const ls = makeMockStorage({ [LS_KEY]: '{"foo":"bar"}' });
+        const result = loadTransactions(ls);
+        assertEqual(result.transactions, [], 'transactions should be []');
+        assertEqual(result.storageError, true, 'storageError should be true');
+      });
+
+      it('returns [] and storageError=true when stored value is a JSON number', function () {
+        const ls = makeMockStorage({ [LS_KEY]: '42' });
+        const result = loadTransactions(ls);
+        assertEqual(result.transactions, [], 'transactions should be []');
+        assertEqual(result.storageError, true, 'storageError should be true');
+      });
+
+      it('returns [] and storageError=true when stored value is a JSON string', function () {
+        const ls = makeMockStorage({ [LS_KEY]: '"hello"' });
+        const result = loadTransactions(ls);
+        assertEqual(result.transactions, [], 'transactions should be []');
+        assertEqual(result.storageError, true, 'storageError should be true');
+      });
+
+    });
+
+    describe('saveTransactions — normal cases', function (it) {
+
+      it('returns { success: true } when save succeeds', function () {
+        const ls = makeMockStorage();
+        const result = saveTransactions(sampleTransactions, ls);
+        assertEqual(result.success, true, 'success should be true');
+        assert(!result.error, 'error should be absent');
+      });
+
+      it('persists the serialized data to the correct key', function () {
+        const ls = makeMockStorage();
+        saveTransactions(sampleTransactions, ls);
+        const stored = ls.getItem(LS_KEY);
+        assert(stored !== null, 'key should exist after save');
+        assertEqual(JSON.parse(stored), sampleTransactions, 'stored data should match input');
+      });
+
+      it('persists an empty array correctly', function () {
+        const ls = makeMockStorage();
+        saveTransactions([], ls);
+        const stored = ls.getItem(LS_KEY);
+        assertEqual(JSON.parse(stored), [], 'stored data should be []');
+      });
+
+    });
+
+    describe('saveTransactions — error cases', function (it) {
+
+      it('returns { success: false, error } when localStorage.setItem throws', function () {
+        const ls = makeQuotaExceededStorage();
+        const result = saveTransactions(sampleTransactions, ls);
+        assertEqual(result.success, false, 'success should be false');
+        assert(typeof result.error === 'string' && result.error.length > 0, 'error should be a non-empty string');
+      });
+
+      it('returns { success: false, error } when localStorage is fully unavailable', function () {
+        const ls = makeThrowingStorage();
+        const result = saveTransactions(sampleTransactions, ls);
+        assertEqual(result.success, false, 'success should be false');
+        assert(typeof result.error === 'string', 'error should be a string');
+      });
+
+    });
+
+    describe('Round-trip: saveTransactions then loadTransactions', function (it) {
+
+      it('round-trips a non-empty transaction array without data loss', function () {
+        const ls = makeMockStorage();
+        saveTransactions(sampleTransactions, ls);
+        const { transactions, storageError } = loadTransactions(ls);
+        assert(deepEqual(transactions, sampleTransactions), 'loaded transactions should deeply equal saved ones');
+        assertEqual(storageError, false, 'storageError should be false');
+      });
+
+      it('round-trips an empty array', function () {
+        const ls = makeMockStorage();
+        saveTransactions([], ls);
+        const { transactions, storageError } = loadTransactions(ls);
+        assertEqual(transactions, [], 'loaded transactions should be []');
+        assertEqual(storageError, false, 'storageError should be false');
+      });
+
+      it('preserves all transaction fields through the round-trip', function () {
+        const ls = makeMockStorage();
+        const tx = [{
+          id: 'test-uuid',
+          description: 'Coffee',
+          amount: 4.75,
+          category: 'Food',
+          type: 'expense',
+          date: '2025-06-01',
+          createdAt: 1748736000000
+        }];
+        saveTransactions(tx, ls);
+        const { transactions } = loadTransactions(ls);
+        const loaded = transactions[0];
+        assertEqual(loaded.id,          tx[0].id,          'id preserved');
+        assertEqual(loaded.description, tx[0].description, 'description preserved');
+        assertEqual(loaded.amount,      tx[0].amount,      'amount preserved');
+        assertEqual(loaded.category,    tx[0].category,    'category preserved');
+        assertEqual(loaded.type,        tx[0].type,        'type preserved');
+        assertEqual(loaded.date,        tx[0].date,        'date preserved');
+        assertEqual(loaded.createdAt,   tx[0].createdAt,   'createdAt preserved');
+      });
+
+    });
+
+    /* ============================================================
+       Render results
+       ============================================================ */
+    (function renderResults() {
+      const output = document.getElementById('output');
+      let totalPass = 0, totalFail = 0;
+
+      results.forEach(function (suite) {
+        const div = document.createElement('div');
+        div.className = 'suite';
+
+        const title = document.createElement('div');
+        title.className = 'suite-title';
+        title.textContent = suite.name;
+        div.appendChild(title);
+
+        suite.tests.forEach(function (t) {
+          const line = document.createElement('div');
+          if (t.passed) {
+            line.className = 'pass';
+            line.textContent = '  ✓ ' + t.name;
+            totalPass++;
+          } else {
+            line.className = 'fail';
+            line.textContent = '  ✗ ' + t.name;
+            const pre = document.createElement('pre');
+            pre.textContent = '    ' + t.error;
+            line.appendChild(pre);
+            totalFail++;
+          }
+          div.appendChild(line);
+        });
+
+        output.appendChild(div);
+      });
+
+      const summary = document.createElement('div');
+      summary.className = 'summary';
+      const allPassed = totalFail === 0;
+      summary.innerHTML =
+        '<span class="' + (allPassed ? 'pass' : 'fail') + '">' +
+        (allPassed ? '✓ All tests passed' : '✗ Some tests failed') +
+        '</span> — ' + totalPass + ' passed, ' + totalFail + ' failed';
+      output.appendChild(summary);
+
+      // Also log to console for CI / headless environments
+      console.log('Tests: ' + totalPass + ' passed, ' + totalFail + ' failed');
+      results.forEach(function (suite) {
+        suite.tests.forEach(function (t) {
+          if (t.passed) {
+            console.log('  PASS: ' + suite.name + ' > ' + t.name);
+          } else {
+            console.error('  FAIL: ' + suite.name + ' > ' + t.name + '\n       ' + t.error);
+          }
+        });
+      });
+    })();
+
+  </script>
+
+  <!-- ============================================================
+       Task 4 — Domain Logic Unit Tests
+       (inline copies of the functions under test so tests run standalone)
+       ============================================================ -->
+  <script>
+    /* ============================================================
+       Inline copies of Task 4 functions
+       ============================================================ */
+
+    const BUILT_IN_CATEGORIES_T4 = ['Food', 'Transport', 'Entertainment', 'Health', 'Shopping', 'Other'];
+
+    function getCategories_t4(state) {
+      return [...BUILT_IN_CATEGORIES_T4, ...(state && state.categories ? state.categories : [])];
+    }
+
+    function computeSummary_t4(transactions) {
+      var totalIncome = 0;
+      var totalExpenses = 0;
+      for (var i = 0; i < transactions.length; i++) {
+        var tx = transactions[i];
+        if (tx.type === 'income') {
+          totalIncome += tx.amount;
+        } else if (tx.type === 'expense') {
+          totalExpenses += tx.amount;
+        }
+      }
+      var balance = totalIncome - totalExpenses;
+      return {
+        balance:       Math.round(balance       * 100) / 100,
+        totalIncome:   Math.round(totalIncome   * 100) / 100,
+        totalExpenses: Math.round(totalExpenses * 100) / 100
+      };
+    }
+
+    function computeCategoryTotals_t4(transactions, state) {
+      var categories = state ? getCategories_t4(state) : BUILT_IN_CATEGORIES_T4.slice();
+      var totals = {};
+      for (var i = 0; i < categories.length; i++) {
+        totals[categories[i]] = 0;
+      }
+      for (var j = 0; j < transactions.length; j++) {
+        var tx = transactions[j];
+        if (tx.type === 'expense') {
+          if (Object.prototype.hasOwnProperty.call(totals, tx.category)) {
+            totals[tx.category] += tx.amount;
+          } else {
+            totals[tx.category] = (totals[tx.category] || 0) + tx.amount;
+          }
+        }
+      }
+      var keys = Object.keys(totals);
+      for (var k = 0; k < keys.length; k++) {
+        totals[keys[k]] = Math.round(totals[keys[k]] * 100) / 100;
+      }
+      return totals;
+    }
+
+    function applyFilter_t4(transactions, filter) {
+      if (!filter || filter === 'All') {
+        return transactions;
+      }
+      if (filter === 'income' || filter === 'expense') {
+        return transactions.filter(function (tx) { return tx.type === filter; });
+      }
+      var filterLower = filter.toLowerCase();
+      if (filterLower === 'income' || filterLower === 'expense') {
+        return transactions.filter(function (tx) { return tx.type === filterLower; });
+      }
+      return transactions.filter(function (tx) { return tx.category === filter; });
+    }
+
+    // deleteTransaction needs saveTransactions — use a no-op version for unit tests
+    function deleteTransaction_t4(state, id) {
+      var updatedTransactions = state.transactions.filter(function (tx) {
+        return tx.id !== id;
+      });
+      return Object.assign({}, state, {
+        transactions:  updatedTransactions,
+        lastSaveError: false
+      });
+    }
+
+    /* ============================================================
+       Sample data for Task 4 tests
+       ============================================================ */
+    var t4_income1 = {
+      id: 't4-1', description: 'Salary', amount: 3000.00,
+      category: 'Other', type: 'income', date: '2025-01-01', createdAt: 1000
+    };
+    var t4_expense1 = {
+      id: 't4-2', description: 'Lunch', amount: 12.50,
+      category: 'Food', type: 'expense', date: '2025-01-15', createdAt: 2000
+    };
+    var t4_expense2 = {
+      id: 't4-3', description: 'Bus', amount: 5.00,
+      category: 'Transport', type: 'expense', date: '2025-01-16', createdAt: 3000
+    };
+    var t4_expense3 = {
+      id: 't4-4', description: 'Movie', amount: 20.00,
+      category: 'Entertainment', type: 'expense', date: '2025-01-17', createdAt: 4000
+    };
+    var t4_income2 = {
+      id: 't4-5', description: 'Freelance', amount: 500.00,
+      category: 'Other', type: 'income', date: '2025-01-20', createdAt: 5000
+    };
+
+    /* ============================================================
+       computeSummary tests
+       ============================================================ */
+    describe('computeSummary — empty list', function (it) {
+
+      it('returns zero balance, income, and expenses for an empty list', function () {
+        var result = computeSummary_t4([]);
+        assertEqual(result.balance,       0, 'balance should be 0');
+        assertEqual(result.totalIncome,   0, 'totalIncome should be 0');
+        assertEqual(result.totalExpenses, 0, 'totalExpenses should be 0');
+      });
+
+    });
+
+    describe('computeSummary — mixed transactions', function (it) {
+
+      it('correctly sums income and expenses', function () {
+        var txns = [t4_income1, t4_expense1, t4_expense2];
+        var result = computeSummary_t4(txns);
+        assertEqual(result.totalIncome,   3000.00, 'totalIncome should be 3000.00');
+        assertEqual(result.totalExpenses, 17.50,   'totalExpenses should be 17.50');
+        assertEqual(result.balance,       2982.50, 'balance should be 2982.50');
+      });
+
+      it('balance equals totalIncome minus totalExpenses', function () {
+        var txns = [t4_income1, t4_income2, t4_expense1, t4_expense2, t4_expense3];
+        var result = computeSummary_t4(txns);
+        var expected = Math.round((result.totalIncome - result.totalExpenses) * 100) / 100;
+        assertEqual(result.balance, expected, 'balance should equal totalIncome - totalExpenses');
+      });
+
+      it('returns negative balance when expenses exceed income', function () {
+        var txns = [
+          { id: 'x1', description: 'Pay', amount: 10.00, category: 'Other', type: 'income', date: '2025-01-01', createdAt: 1 },
+          { id: 'x2', description: 'Rent', amount: 50.00, category: 'Other', type: 'expense', date: '2025-01-02', createdAt: 2 }
+        ];
+        var result = computeSummary_t4(txns);
+        assertEqual(result.balance, -40.00, 'balance should be -40.00');
+      });
+
+      it('rounds to 2 decimal places', function () {
+        var txns = [
+          { id: 'r1', description: 'A', amount: 0.1, category: 'Food', type: 'income', date: '2025-01-01', createdAt: 1 },
+          { id: 'r2', description: 'B', amount: 0.2, category: 'Food', type: 'income', date: '2025-01-01', createdAt: 2 }
+        ];
+        var result = computeSummary_t4(txns);
+        // 0.1 + 0.2 in floating point is 0.30000000000000004; should round to 0.30
+        assertEqual(result.totalIncome, 0.30, 'totalIncome should be rounded to 0.30');
+      });
+
+      it('income-only list has zero expenses and positive balance', function () {
+        var result = computeSummary_t4([t4_income1, t4_income2]);
+        assertEqual(result.totalExpenses, 0,       'totalExpenses should be 0');
+        assertEqual(result.totalIncome,   3500.00, 'totalIncome should be 3500.00');
+        assertEqual(result.balance,       3500.00, 'balance should be 3500.00');
+      });
+
+      it('expense-only list has zero income and negative balance', function () {
+        var result = computeSummary_t4([t4_expense1, t4_expense2]);
+        assertEqual(result.totalIncome,   0,     'totalIncome should be 0');
+        assertEqual(result.totalExpenses, 17.50, 'totalExpenses should be 17.50');
+        assertEqual(result.balance,       -17.50, 'balance should be -17.50');
+      });
+
+    });
+
+    /* ============================================================
+       computeCategoryTotals tests
+       ============================================================ */
+    describe('computeCategoryTotals — no expenses', function (it) {
+
+      it('returns all six built-in categories with zero totals when list is empty', function () {
+        var totals = computeCategoryTotals_t4([]);
+        var keys = Object.keys(totals);
+        assert(keys.length >= 6, 'should have at least 6 categories');
+        BUILT_IN_CATEGORIES_T4.forEach(function (cat) {
+          assert(Object.prototype.hasOwnProperty.call(totals, cat), 'should have category: ' + cat);
+          assertEqual(totals[cat], 0, cat + ' total should be 0');
+        });
+      });
+
+      it('returns all six built-in categories with zero totals when only income transactions exist', function () {
+        var totals = computeCategoryTotals_t4([t4_income1, t4_income2]);
+        BUILT_IN_CATEGORIES_T4.forEach(function (cat) {
+          assertEqual(totals[cat], 0, cat + ' total should be 0 (income only)');
+        });
+      });
+
+    });
+
+    describe('computeCategoryTotals — mixed transactions', function (it) {
+
+      it('sums expense amounts per category correctly', function () {
+        var txns = [t4_income1, t4_expense1, t4_expense2, t4_expense3];
+        var totals = computeCategoryTotals_t4(txns);
+        assertEqual(totals['Food'],          12.50, 'Food total should be 12.50');
+        assertEqual(totals['Transport'],      5.00, 'Transport total should be 5.00');
+        assertEqual(totals['Entertainment'], 20.00, 'Entertainment total should be 20.00');
+        assertEqual(totals['Health'],         0,    'Health total should be 0');
+        assertEqual(totals['Shopping'],       0,    'Shopping total should be 0');
+        assertEqual(totals['Other'],          0,    'Other total should be 0 (income not counted)');
+      });
+
+      it('accumulates multiple expenses in the same category', function () {
+        var txns = [
+          { id: 'f1', description: 'Breakfast', amount: 5.00, category: 'Food', type: 'expense', date: '2025-01-01', createdAt: 1 },
+          { id: 'f2', description: 'Lunch',     amount: 10.00, category: 'Food', type: 'expense', date: '2025-01-01', createdAt: 2 },
+          { id: 'f3', description: 'Dinner',    amount: 15.00, category: 'Food', type: 'expense', date: '2025-01-01', createdAt: 3 }
+        ];
+        var totals = computeCategoryTotals_t4(txns);
+        assertEqual(totals['Food'], 30.00, 'Food total should be 30.00');
+      });
+
+      it('includes custom categories from state', function () {
+        var state = { categories: ['Groceries'] };
+        var txns = [
+          { id: 'g1', description: 'Veggies', amount: 25.00, category: 'Groceries', type: 'expense', date: '2025-01-01', createdAt: 1 }
+        ];
+        var totals = computeCategoryTotals_t4(txns, state);
+        assert(Object.prototype.hasOwnProperty.call(totals, 'Groceries'), 'should include custom category Groceries');
+        assertEqual(totals['Groceries'], 25.00, 'Groceries total should be 25.00');
+      });
+
+      it('sum of all category totals equals total expenses', function () {
+        var txns = [t4_income1, t4_expense1, t4_expense2, t4_expense3];
+        var totals = computeCategoryTotals_t4(txns);
+        var sum = Object.keys(totals).reduce(function (acc, k) { return acc + totals[k]; }, 0);
+        sum = Math.round(sum * 100) / 100;
+        var summary = computeSummary_t4(txns);
+        assertEqual(sum, summary.totalExpenses, 'sum of category totals should equal totalExpenses');
+      });
+
+    });
+
+    /* ============================================================
+       applyFilter tests
+       ============================================================ */
+    describe('applyFilter — All filter', function (it) {
+
+      var allTxns = [t4_income1, t4_expense1, t4_expense2, t4_income2, t4_expense3];
+
+      it('returns all transactions when filter is "All"', function () {
+        var result = applyFilter_t4(allTxns, 'All');
+        assertEqual(result.length, allTxns.length, 'should return all transactions');
+      });
+
+      it('returns all transactions when filter is undefined', function () {
+        var result = applyFilter_t4(allTxns, undefined);
+        assertEqual(result.length, allTxns.length, 'should return all transactions for undefined filter');
+      });
+
+      it('returns all transactions when filter is empty string', function () {
+        var result = applyFilter_t4(allTxns, '');
+        assertEqual(result.length, allTxns.length, 'should return all transactions for empty filter');
+      });
+
+    });
+
+    describe('applyFilter — type filters', function (it) {
+
+      var allTxns = [t4_income1, t4_expense1, t4_expense2, t4_income2, t4_expense3];
+
+      it('returns only income transactions when filter is "Income"', function () {
+        var result = applyFilter_t4(allTxns, 'Income');
+        assert(result.length === 2, 'should return 2 income transactions');
+        result.forEach(function (tx) {
+          assertEqual(tx.type, 'income', 'each result should be income type');
+        });
+      });
+
+      it('returns only expense transactions when filter is "Expense"', function () {
+        var result = applyFilter_t4(allTxns, 'Expense');
+        assert(result.length === 3, 'should return 3 expense transactions');
+        result.forEach(function (tx) {
+          assertEqual(tx.type, 'expense', 'each result should be expense type');
+        });
+      });
+
+      it('returns only income transactions when filter is lowercase "income"', function () {
+        var result = applyFilter_t4(allTxns, 'income');
+        assert(result.length === 2, 'should return 2 income transactions for lowercase filter');
+      });
+
+      it('returns only expense transactions when filter is lowercase "expense"', function () {
+        var result = applyFilter_t4(allTxns, 'expense');
+        assert(result.length === 3, 'should return 3 expense transactions for lowercase filter');
+      });
+
+    });
+
+    describe('applyFilter — category filters', function (it) {
+
+      var allTxns = [t4_income1, t4_expense1, t4_expense2, t4_income2, t4_expense3];
+
+      it('returns only Food transactions when filter is "Food"', function () {
+        var result = applyFilter_t4(allTxns, 'Food');
+        assert(result.length === 1, 'should return 1 Food transaction');
+        assertEqual(result[0].category, 'Food', 'result should be Food category');
+      });
+
+      it('returns only Transport transactions when filter is "Transport"', function () {
+        var result = applyFilter_t4(allTxns, 'Transport');
+        assert(result.length === 1, 'should return 1 Transport transaction');
+        assertEqual(result[0].category, 'Transport', 'result should be Transport category');
+      });
+
+      it('returns only Entertainment transactions when filter is "Entertainment"', function () {
+        var result = applyFilter_t4(allTxns, 'Entertainment');
+        assert(result.length === 1, 'should return 1 Entertainment transaction');
+        assertEqual(result[0].category, 'Entertainment', 'result should be Entertainment category');
+      });
+
+      it('returns empty array when no transactions match the category filter', function () {
+        var result = applyFilter_t4(allTxns, 'Health');
+        assertEqual(result.length, 0, 'should return empty array for Health (no Health transactions)');
+      });
+
+      it('returns only Other transactions when filter is "Other"', function () {
+        var result = applyFilter_t4(allTxns, 'Other');
+        assert(result.length === 2, 'should return 2 Other transactions (both income)');
+        result.forEach(function (tx) {
+          assertEqual(tx.category, 'Other', 'each result should be Other category');
+        });
+      });
+
+    });
+
+    /* ============================================================
+       deleteTransaction tests
+       ============================================================ */
+    describe('deleteTransaction — removes the correct transaction', function (it) {
+
+      var baseState = {
+        transactions: [t4_income1, t4_expense1, t4_expense2, t4_income2, t4_expense3],
+        activeFilter: 'All',
+        categories: []
+      };
+
+      it('reduces the transaction list length by exactly 1', function () {
+        var result = deleteTransaction_t4(baseState, 't4-2');
+        assertEqual(result.transactions.length, baseState.transactions.length - 1,
+          'list should shrink by 1');
+      });
+
+      it('removes the transaction with the given id', function () {
+        var result = deleteTransaction_t4(baseState, 't4-2');
+        var found = result.transactions.find(function (tx) { return tx.id === 't4-2'; });
+        assert(!found, 'deleted transaction should not be in the result');
+      });
+
+      it('preserves all other transactions unchanged', function () {
+        var result = deleteTransaction_t4(baseState, 't4-2');
+        var remaining = result.transactions;
+        var expectedIds = ['t4-1', 't4-3', 't4-4', 't4-5'];
+        assertEqual(remaining.length, expectedIds.length, 'should have 4 remaining transactions');
+        expectedIds.forEach(function (id) {
+          var found = remaining.find(function (tx) { return tx.id === id; });
+          assert(found, 'transaction ' + id + ' should still be present');
+        });
+      });
+
+      it('deleting the first transaction works correctly', function () {
+        var result = deleteTransaction_t4(baseState, 't4-1');
+        assertEqual(result.transactions.length, 4, 'should have 4 transactions after delete');
+        var found = result.transactions.find(function (tx) { return tx.id === 't4-1'; });
+        assert(!found, 'first transaction should be removed');
+      });
+
+      it('deleting the last transaction works correctly', function () {
+        var result = deleteTransaction_t4(baseState, 't4-5');
+        assertEqual(result.transactions.length, 4, 'should have 4 transactions after delete');
+        var found = result.transactions.find(function (tx) { return tx.id === 't4-5'; });
+        assert(!found, 'last transaction should be removed');
+      });
+
+      it('deleting from a single-item list returns an empty list', function () {
+        var singleState = { transactions: [t4_income1], categories: [] };
+        var result = deleteTransaction_t4(singleState, 't4-1');
+        assertEqual(result.transactions.length, 0, 'list should be empty after deleting the only transaction');
+      });
+
+      it('deleting a non-existent id leaves the list unchanged', function () {
+        var result = deleteTransaction_t4(baseState, 'does-not-exist');
+        assertEqual(result.transactions.length, baseState.transactions.length,
+          'list length should be unchanged when id not found');
+      });
+
+      it('does not mutate the original state', function () {
+        var originalLength = baseState.transactions.length;
+        deleteTransaction_t4(baseState, 't4-2');
+        assertEqual(baseState.transactions.length, originalLength,
+          'original state.transactions should not be mutated');
+      });
+
+    });
+
+  </script>
+</body>
+</html>
